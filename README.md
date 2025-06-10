@@ -1,3 +1,6 @@
+## Restore instance EC2 from glacier
+
+```
 bucketName=<Bucket on estan els discs>
 prefix=<path on es guarda>
 subnetID=<id de la subnet on restaurarem>
@@ -6,3 +9,4 @@ instanceType=<tamany de la instancia>
 region=<regio>
 projectTag=<tag>
 nameTag=<tag>
+```
