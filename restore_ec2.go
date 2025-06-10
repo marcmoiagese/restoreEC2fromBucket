@@ -125,7 +125,7 @@ func waitForVMDKsRestored(ctx context.Context, client *s3.Client, config *Config
 
 				result, err := client.HeadObject(ctx, input)
 				if err != nil {
-					log.Printf("Error llegint capçalera de %s: %v", key, err)
+					fmt.Printf("Error llegint capçalera de %s: %v", key, err)
 					allRestored = false
 					break
 				}
@@ -136,14 +136,14 @@ func waitForVMDKsRestored(ctx context.Context, client *s3.Client, config *Config
 				}
 
 				if restoreHeader != "" && !strings.Contains(restoreHeader, "ongoing-request=\"false\"") {
-					log.Printf("Restauració en curs per %s: %s", key, restoreHeader)
+					fmt.Printf("Restauració en curs per %s: %s", key, restoreHeader)
 					allRestored = false
 					break
 				}
 			}
 
 			if allRestored {
-				fmt.Println("Tots els fitxers VMDK han estat restaurats del Glacier")
+				fmt.Printf("Tots els fitxers VMDK han estat restaurats del Glacier")
 				return nil
 			}
 
@@ -188,7 +188,7 @@ func main() {
 		err := restoreFromGlacier(ctx, s3Client, config, file)
 		now = time.Now().Format("02-01-2006 15:04")
 		if err != nil {
-			log.Printf("[%s] Error restaurant %s: %v", now, file, err)
+			fmt.Printf("[%s] Error restaurant %s: %v", now, file, err)
 		} else {
 			fmt.Printf("[%s] Restauració iniciada per %s\n", now, file)
 		}
@@ -209,7 +209,7 @@ func main() {
 	for _, file := range vmdkFiles {
 		snapshotID, err := createSnapshotFromVMDK(ctx, ec2Client, config, file)
 		if err != nil {
-			log.Printf("Error creant snapshot per %s: %v", file, err)
+			fmt.Printf("Error creant snapshot per %s: %v", file, err)
 		} else {
 			fmt.Printf("Snapshot creat: %s per %s\n", snapshotID, file)
 			snapshotIDs = append(snapshotIDs, snapshotID)
@@ -219,12 +219,49 @@ func main() {
 	// 5. Esperar que els snapshots acabin
 	now = time.Now().Format("02-01-2006 15:04")
 	fmt.Printf("[%s] Esperant que snapshots estiguin completats...", now)
-	for _, snapshotID := range snapshotIDs {
-		err := waitForSnapshotComplete(ctx, ec2Client, snapshotID)
+
+	type result struct {
+		snapshotID string
+		err        error
+	}
+
+	realSnapshotIDs := make([]string, 0, len(snapshotIDs))
+	resultsChan := make(chan result, len(snapshotIDs))
+
+	for _, importTaskID := range snapshotIDs {
+		go func(taskID string) {
+			realSnapshotID, err := waitForSnapshotComplete(ctx, ec2Client, taskID)
+			resultsChan <- result{snapshotID: realSnapshotID, err: err}
+		}(importTaskID)
+	}
+
+	for i := 0; i < len(snapshotIDs); i++ {
+		res := <-resultsChan
+		if res.err != nil {
+			fmt.Printf("Error esperant snapshot: %v", res.err)
+			continue
+		}
+		realSnapshotIDs = append(realSnapshotIDs, res.snapshotID)
+
+		// Aplicar etiquetes immediatament
+		_, err := ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
+			Resources: []string{res.snapshotID},
+			Tags:      getCommonTags(config),
+		})
 		if err != nil {
-			log.Printf("Error esperant snapshot %s: %v", snapshotID, err)
+			fmt.Printf("Error afegint etiquetes a la snapshot %s: %v", res.snapshotID, err)
+		} else {
+			fmt.Printf("Etiquetes aplicades a la snapshot %s\n", res.snapshotID)
 		}
 	}
+
+	if len(realSnapshotIDs) == 0 {
+		log.Fatalf("No s'han completat cap snapshot")
+	}
+	snapshotIDs = realSnapshotIDs
+
+	// Validacio manual dels snapshots
+	//aws ec2 describe-snapshots --snapshot-ids < Ids > --query 'Snapshots[*].[SnapshotId,Tags]'
 
 	// 6. Crear volums EBS a partir dels snapshots
 	now = time.Now().Format("02-01-2006 15:04")
@@ -233,7 +270,7 @@ func main() {
 	for _, snapshotID := range snapshotIDs {
 		volumeID, err := createVolumeFromSnapshot(ctx, ec2Client, config, snapshotID)
 		if err != nil {
-			log.Printf("Error creant volum per snapshot %s: %v", snapshotID, err)
+			fmt.Printf("Error creant volum per snapshot %s: %v", snapshotID, err)
 		} else {
 			fmt.Printf("Volum creat: %s\n", volumeID)
 			volumeIDs = append(volumeIDs, volumeID)
@@ -243,44 +280,61 @@ func main() {
 				Tags:      getCommonTags(config),
 			})
 			if err != nil {
-				log.Printf("Error afegint etiquetes al volum %s: %v", volumeID, err)
+				fmt.Printf("Error afegint etiquetes al volum %s: %v", volumeID, err)
 			}
 		}
 	}
 
 	// 7. Crear AMI a partir del primer snapshot (root)
+	now = time.Now().Format("02-01-2006 15:04")
+	fmt.Printf("[%s] Creant AMI a partir del primer snapshot...", now)
 	rootSnapshotID := snapshotIDs[0]
 	amiID, err := createAMIFromRootSnapshot(ctx, ec2Client, config, rootSnapshotID)
 	if err != nil {
 		log.Fatalf("Error registrant AMI: %v", err)
 	}
 
+	// 7.1 Afegir etiquetes a l'AMI
+	now = time.Now().Format("02-01-2006 15:04")
+	fmt.Printf("[%s] Afegint etiquetes a la AMI...", now)
+	_, err = ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
+		Resources: []string{amiID},
+		Tags:      getCommonTags(config),
+	})
+	if err != nil {
+		fmt.Printf("Error afegint etiquetes a l'AMI %s: %v", amiID, err)
+	}
+
 	// 8. Crear instància amb tots els volums adjuntats directament
+	now = time.Now().Format("02-01-2006 15:04")
+	fmt.Printf("[%s] Creant instancia amb tots els volums...", now)
 	instanceID, err := createEC2InstanceWithVolumes(ctx, ec2Client, config, amiID, volumeIDs, vmdkFiles)
 	if err != nil {
 		log.Fatalf("Error creant instància EC2: %v", err)
 	}
 
 	// 9. Afegir etiquetes a la instància
+	now = time.Now().Format("02-01-2006 15:04")
+	fmt.Printf("[%s] Afegint etiquetes a l'instancia...", now)
 	_, err = ec2Client.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{instanceID},
 		Tags:      getCommonTags(config),
 	})
 	if err != nil {
-		log.Printf("Error afegint etiquetes a la instància %s: %v", instanceID, err)
+		fmt.Printf("Error afegint etiquetes a la instància %s: %v", instanceID, err)
 	}
 	fmt.Printf("Instància EC2 creada amb èxit: %s\n", instanceID)
 
 	// 10. tornar els fitxers VMDK al Glacier
-	fmt.Println("Retornant fitxers VMDK al Glacier...")
+	/*fmt.Printf("Retornant fitxers VMDK al Glacier...")
 	for _, file := range vmdkFiles {
 		err := moveVMDKBackToGlacier(ctx, s3Client, config, file)
 		if err != nil {
-			log.Printf("Error retornant %s al Glacier: %v", file, err)
+			fmt.Printf("Error retornant %s al Glacier: %v", file, err)
 		} else {
 			fmt.Printf("Fitxer %s retornat al Glacier\n", file)
 		}
-	}
+	}*/
 }
 
 // Llistar fitxers .vmdk al bucket
@@ -341,27 +395,44 @@ func createSnapshotFromVMDK(ctx context.Context, client *ec2.Client, config *Con
 }
 
 // Esperar que el snapshot acabi
-func waitForSnapshotComplete(ctx context.Context, client *ec2.Client, importTaskID string) error {
+func waitForSnapshotComplete(ctx context.Context, client *ec2.Client, importTaskID string) (string, error) {
 	for {
 		input := &ec2.DescribeImportSnapshotTasksInput{
 			ImportTaskIds: []string{importTaskID},
 		}
 		result, err := client.DescribeImportSnapshotTasks(ctx, input)
 		if err != nil {
-			return err
+			return "", fmt.Errorf("error descrivint tasca d'importació (%s): %v", importTaskID, err)
 		}
 		if len(result.ImportSnapshotTasks) == 0 {
-			return fmt.Errorf("no s'ha trobat la tasca d'importació")
+			return "", fmt.Errorf("no s'ha trobat la tasca d'importació: %s", importTaskID)
 		}
 		task := result.ImportSnapshotTasks[0]
+
+		var status string
+		if task.SnapshotTaskDetail != nil && task.SnapshotTaskDetail.Status != nil {
+			status = *task.SnapshotTaskDetail.Status
+		} else {
+			status = "unknown"
+		}
+
 		if task.SnapshotTaskDetail != nil {
-			status := *task.SnapshotTaskDetail.Status
 			if status == "completed" {
-				return nil
+				if task.SnapshotTaskDetail.SnapshotId != nil {
+					snapshotID := *task.SnapshotTaskDetail.SnapshotId
+					fmt.Printf("[TASK %s] Snapshot completada amb ID: %s\n", importTaskID, snapshotID)
+					return snapshotID, nil
+				}
+				return "", fmt.Errorf("snapshot completada però sense ID")
 			} else if status == "error" {
-				return fmt.Errorf("error en la tasca d'importació")
+				msg := "desconegut"
+				if task.SnapshotTaskDetail.StatusMessage != nil {
+					msg = *task.SnapshotTaskDetail.StatusMessage
+				}
+				return "", fmt.Errorf("[TASK %s] error en la tasca d'importació: %s", importTaskID, msg)
 			}
 		}
+		fmt.Printf("[TASK %s] Esperant que la snapshot finalitzi... Estat actual: %s\n", importTaskID, status)
 		time.Sleep(30 * time.Second)
 	}
 }
@@ -404,6 +475,8 @@ func createAMIFromRootSnapshot(ctx context.Context, client *ec2.Client, config *
 		Description:        aws.String("AMI restaurada a partir del disc root"),
 		RootDeviceName:     aws.String("/dev/sda1"),
 		VirtualizationType: aws.String("hvm"),
+		EnaSupport:         aws.Bool(true),
+		Architecture:       types.ArchitectureValuesX8664,
 		BlockDeviceMappings: []types.BlockDeviceMapping{
 			{
 				DeviceName: aws.String("/dev/sda1"),
@@ -450,11 +523,12 @@ func mapVolumeIDsToDeviceNames(volumeIDs []string, vmdkFiles []string) map[strin
 // Crear instància amb tots els volums adjuntats
 func createEC2InstanceWithVolumes(ctx context.Context, client *ec2.Client, config *Config, amiID string, volumeIDs []string, vmdkFiles []string) (string, error) {
 	runInput := &ec2.RunInstancesInput{
-		ImageId:      aws.String(amiID),
-		InstanceType: types.InstanceType(config.InstanceType),
-		MinCount:     aws.Int32(1),
-		MaxCount:     aws.Int32(1),
-		SubnetId:     aws.String(config.SubnetID),
+		ImageId:          aws.String(amiID),
+		InstanceType:     types.InstanceType(config.InstanceType),
+		MinCount:         aws.Int32(1),
+		MaxCount:         aws.Int32(1),
+		SubnetId:         aws.String(config.SubnetID),
+		SecurityGroupIds: []string{"sg-05c55aea4c7177179"},
 		IamInstanceProfile: &types.IamInstanceProfileSpecification{
 			Name: aws.String(config.IAMRole),
 		},
@@ -510,6 +584,10 @@ func createEC2InstanceWithVolumes(ctx context.Context, client *ec2.Client, confi
 			break
 		}
 	}
+
+	// Esperem uns segons per assegurar-nos que el volum estigui desconnectat
+	log.Println("Esperant 60 segons perquè el volum temporal es desconnecti...")
+	time.Sleep(60 * time.Second)
 
 	// Obtenir mapeig entre volums i noms de dispositius
 	deviceMapping := mapVolumeIDsToDeviceNames(volumeIDs, vmdkFiles)
